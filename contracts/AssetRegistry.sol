@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 /// @title AssetRegistry - on-chain asset logging dengan role-based access control
 /// Role: Admin (kelola role), Manager (tambah/ubah/hapus aset), Editor (tambah/ubah aset), Viewer (hanya baca)
@@ -48,7 +48,9 @@ contract AssetRegistry {
     }
 
     function revokeRole(address account) external atLeast(Role.Admin) {
+        require(account != address(0), "Alamat tidak valid");
         require(account != msg.sender, "Tidak bisa mencabut role sendiri");
+        require(roles[account] != Role.None, "Wallet belum memiliki role");
         _setRole(account, Role.None);
     }
 
@@ -66,6 +68,29 @@ contract AssetRegistry {
         for (uint256 i = 0; i < members.length; i++) rs[i] = roles[members[i]];
     }
 
+    function hasText(string calldata value) private pure returns (bool) {
+        bytes calldata chars = bytes(value);
+        for (uint256 i = 0; i < chars.length; i++) {
+            uint8 char = uint8(chars[i]);
+            if (char != 32 && (char < 9 || char > 13)) return true;
+        }
+        return false;
+    }
+
+    function validateAsset(
+        string calldata name,
+        string calldata category,
+        string calldata location,
+        string calldata condition,
+        address custodian
+    ) private pure {
+        require(hasText(name), "Nama wajib diisi");
+        require(hasText(category), "Kategori wajib diisi");
+        require(hasText(location), "Lokasi wajib diisi");
+        require(hasText(condition), "Kondisi wajib diisi");
+        require(custodian != address(0), "Alamat penanggung jawab tidak valid");
+    }
+
     // ---------- Asset CRUD ----------
     /// CREATE (Editor+)
     function createAsset(
@@ -75,7 +100,7 @@ contract AssetRegistry {
         string calldata condition,
         address custodian
     ) external atLeast(Role.Editor) returns (uint256 id) {
-        require(bytes(name).length > 0, "Nama wajib diisi");
+        validateAsset(name, category, location, condition, custodian);
         id = assets.length;
         assets.push(Asset(id, name, category, location, condition, custodian, msg.sender,
             uint64(block.timestamp), uint64(block.timestamp), true));
@@ -108,7 +133,7 @@ contract AssetRegistry {
         address custodian
     ) external atLeast(Role.Editor) {
         require(id < assets.length && assets[id].active, "Aset tidak ditemukan");
-        require(bytes(name).length > 0, "Nama wajib diisi");
+        validateAsset(name, category, location, condition, custodian);
         Asset storage a = assets[id];
         a.name = name; a.category = category; a.location = location;
         a.condition = condition; a.custodian = custodian;

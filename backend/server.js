@@ -1,118 +1,225 @@
-require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
-const crypto = require("crypto");
+const crypto = require("node:crypto");
+const path = require("node:path");
+const fs = require("node:fs");
 const Database = require("better-sqlite3");
 const { ethers } = require("ethers");
-const contractInfo = require("./contract.json"); // dibuat otomatis oleh scripts/deploy.js
+const { getDeploymentRpcUrl, readDeploymentCode } = require("../scripts/deployment-networks");
 
 const ROLES = ["None", "Viewer", "Editor", "Manager", "Admin"];
-const { PORT = 4000, JWT_SECRET, RPC_URL = "http://127.0.0.1:8545", FRONTEND_ORIGIN } = process.env;
-if (!JWT_SECRET) throw new Error("JWT_SECRET belum diisi di backend/.env");
+const NONCE_TTL = 5 * 60 * 1000;
+const ISSUER = "asset-logging-dapp";
+const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
 
-const provider = new ethers.JsonRpcProvider(RPC_URL);
-const registry = new ethers.Contract(contractInfo.address, contractInfo.abi, provider);
-
-// ---------- Off-chain database (SQLite) ----------
-const db = new Database("data.db");
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  address TEXT PRIMARY KEY,
-  name TEXT, email TEXT, department TEXT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS nonces (address TEXT PRIMARY KEY, nonce TEXT, expires INTEGER);
-`);
-
-const app = express();
-app.use(cors({ origin: FRONTEND_ORIGIN || true }));
-app.use(express.json());
-
-const roleOf = async (addr) => ROLES[Number(await registry.getRole(addr))];
-const norm = (a) => ethers.getAddress(a); // checksum + validasi
-
-// ---------- Authentication: login dengan tanda tangan wallet ----------
-app.get("/api/auth/nonce/:address", (req, res) => {
+function walletAddress(value) {
   try {
-    const address = norm(req.params.address);
+    const address = ethers.getAddress(value);
+    if (address !== ethers.ZeroAddress) return address;
+  } catch {
+    // Invalid wallet input is handled below.
+  }
+  throw badRequest("Alamat wallet tidak valid.");
+}
+
+function profileFields(body) {
+  const fields = [["name", "Nama", 120], ["email", "Email", 254], ["department", "Departemen", 120]];
+  const values = fields.map(([key, label, max]) => {
+    const value = typeof body?.[key] === "string" ? body[key].trim() : "";
+    if (!value || value.length > max) {
+      throw badRequest(label + " wajib diisi (maksimal " + max + " karakter).");
+    }
+    return value;
+  });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values[1])) throw badRequest("Format email tidak valid.");
+  return values;
+}
+
+function createApp({ db, registry, deployment, jwtSecret, frontendOrigin }) {
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS users (" +
+      "address TEXT PRIMARY KEY, name TEXT, email TEXT, department TEXT, " +
+      "created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);" +
+    "CREATE TABLE IF NOT EXISTS nonces (address TEXT PRIMARY KEY, nonce TEXT, expires INTEGER);"
+  );
+
+  const app = express();
+  app.use(cors({ origin: frontendOrigin }));
+  app.use(express.json({ limit: "16kb" }));
+
+  const { address: contractAddress, chainId, codeHash } = deployment;
+  const audience = [chainId, contractAddress, codeHash].join(":");
+  const roleOf = async (address) => {
+    const role = ROLES[Number(await registry.getRole(address))];
+    if (!role) throw new Error("Role contract tidak dikenali.");
+    return role;
+  };
+  const chainError = (res) => {
+    console.error("Gagal membaca role dari AssetRegistry.");
+    return res.status(503).json({ error: "Blockchain tidak dapat diakses. Periksa node dan deployment." });
+  };
+  const loginMessage = (address, nonce) => [
+    "Login ke Asset Logging dApp", "Aplikasi: " + frontendOrigin, "Alamat: " + address,
+    "Chain ID: " + chainId, "AssetRegistry: " + contractAddress, "Nonce: " + nonce,
+  ].join("\n");
+
+  // ---------- Login dengan tanda tangan wallet ----------
+  app.get("/api/auth/nonce/:address", (req, res) => {
+    const address = walletAddress(req.params.address);
     const nonce = crypto.randomBytes(16).toString("hex");
-    db.prepare("INSERT OR REPLACE INTO nonces VALUES (?,?,?)").run(address, nonce, Date.now() + 5 * 60 * 1000);
-    res.json({ message: `Login ke Asset Logging dApp\nAlamat: ${address}\nNonce: ${nonce}` });
-  } catch { res.status(400).json({ error: "Alamat tidak valid" }); }
-});
+    db.prepare("INSERT OR REPLACE INTO nonces (address, nonce, expires) VALUES (?, ?, ?)")
+      .run(address, nonce, Date.now() + NONCE_TTL);
+    res.set("Cache-Control", "no-store").json({ message: loginMessage(address, nonce), deployment });
+  });
 
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const address = norm(req.body.address);
-    const row = db.prepare("SELECT * FROM nonces WHERE address=?").get(address);
-    if (!row || row.expires < Date.now()) return res.status(401).json({ error: "Nonce kedaluwarsa, coba lagi" });
-    const message = `Login ke Asset Logging dApp\nAlamat: ${address}\nNonce: ${row.nonce}`;
-    if (ethers.verifyMessage(message, req.body.signature) !== address)
-      return res.status(401).json({ error: "Tanda tangan tidak cocok" });
-    db.prepare("DELETE FROM nonces WHERE address=?").run(address); // nonce sekali pakai
+  app.post("/api/auth/login", async (req, res, next) => {
+    try {
+      const address = walletAddress(req.body?.address);
+      const row = db.prepare("SELECT nonce, expires FROM nonces WHERE address = ?").get(address);
+      const expired = () => res.status(401).json({ error: "Nonce kedaluwarsa atau sudah dipakai. Masuk kembali." });
+      if (!row || row.expires <= Date.now()) return expired();
 
-    const role = await roleOf(address); // role dibaca dari blockchain
-    if (role === "None") return res.status(403).json({ error: "Wallet ini belum memiliki role. Hubungi Admin." });
-    const token = jwt.sign({ address, role }, JWT_SECRET, { expiresIn: "2h" });
-    res.json({ token, address, role });
-  } catch (e) { res.status(400).json({ error: e.message }); }
-});
+      let signer;
+      try {
+        signer = ethers.verifyMessage(loginMessage(address, row.nonce), req.body.signature);
+      } catch {
+        return res.status(401).json({ error: "Tanda tangan tidak valid." });
+      }
+      if (signer !== address) return res.status(401).json({ error: "Tanda tangan tidak cocok." });
 
-// ---------- Authorization middleware ----------
-const auth = (...allowed) => async (req, res, next) => {
-  try {
-    const payload = jwt.verify((req.headers.authorization || "").replace("Bearer ", ""), JWT_SECRET);
-    const role = await roleOf(payload.address); // cek ulang role terbaru di chain
-    if (role === "None") return res.status(403).json({ error: "Role dicabut" });
-    if (allowed.length && !allowed.includes(role)) return res.status(403).json({ error: "Akses ditolak" });
-    req.user = { address: payload.address, role };
+      // One SQL statement checks expiry and consumes only this exact challenge.
+      const consumed = db.prepare("DELETE FROM nonces WHERE address = ? AND nonce = ? AND expires > ?")
+        .run(address, row.nonce, Date.now());
+      if (!consumed.changes) return expired();
+
+      const role = await roleOf(address).catch(() => { chainError(res); });
+      if (!role) return;
+      if (role === "None") {
+        return res.status(403).json({ error: "Wallet ini belum memiliki role. Hubungi Admin." });
+      }
+      const token = jwt.sign({ address }, jwtSecret, {
+        algorithm: "HS256", audience, issuer: ISSUER, expiresIn: "2h",
+      });
+      res.set("Cache-Control", "no-store").json({ token, address, role });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // ---------- Role selalu dibaca ulang dari blockchain ----------
+  const auth = (...allowed) => async (req, res, next) => {
+    let address;
+    try {
+      const token = /^Bearer (\S+)$/i.exec(req.get("Authorization") || "")?.[1];
+      const payload = jwt.verify(token, jwtSecret, { algorithms: ["HS256"], audience, issuer: ISSUER });
+      address = walletAddress(payload.address);
+    } catch {
+      return res.status(401).json({ error: "Sesi tidak valid atau kedaluwarsa. Masuk kembali." });
+    }
+
+    const role = await roleOf(address).catch(() => { chainError(res); });
+    if (!role) return;
+    if (role === "None") return res.status(403).json({ error: "Role dicabut.", code: "ROLE_REVOKED" });
+    if (allowed.length && !allowed.includes(role)) return res.status(403).json({ error: "Akses ditolak." });
+    req.user = { address, role };
     next();
-  } catch { res.status(401).json({ error: "Belum login" }); }
-};
+  };
 
-// ---------- Off-chain CRUD: profil user ----------
-const fields = (b) => [b.name?.trim() || null, b.email?.trim() || null, b.department?.trim() || null];
+  // ---------- CRUD profil SQLite ----------
+  const userByAddress = db.prepare("SELECT * FROM users WHERE address = ?");
+  const saveUser = db.prepare(
+    "INSERT INTO users (address, name, email, department) VALUES (?, ?, ?, ?) " +
+    "ON CONFLICT(address) DO UPDATE SET name = excluded.name, email = excluded.email, " +
+    "department = excluded.department, updated_at = CURRENT_TIMESTAMP"
+  );
+  const upsert = (address, body, res) => {
+    saveUser.run(address, ...profileFields(body));
+    res.json(userByAddress.get(address));
+  };
 
-// READ profil sendiri
-app.get("/api/users/me", auth(), (req, res) => {
-  const row = db.prepare("SELECT * FROM users WHERE address=?").get(req.user.address);
-  res.json({ ...(row || { address: req.user.address }), role: req.user.role });
-});
+  app.get("/api/users/me", auth(), (req, res) => {
+    const { address, role } = req.user;
+    const row = userByAddress.get(address);
+    res.json({ ...(row || { address }), role });
+  });
 
-// CREATE / UPDATE profil sendiri
-app.put("/api/users/me", auth(), (req, res) => {
-  const [name, email, department] = fields(req.body);
-  db.prepare(`INSERT INTO users (address,name,email,department) VALUES (?,?,?,?)
-    ON CONFLICT(address) DO UPDATE SET name=?, email=?, department=?, updated_at=CURRENT_TIMESTAMP`)
-    .run(req.user.address, name, email, department, name, email, department);
-  res.json(db.prepare("SELECT * FROM users WHERE address=?").get(req.user.address));
-});
+  app.put("/api/users/me", auth(), (req, res) => upsert(req.user.address, req.body, res));
 
-// READ semua user (Admin, Manager & Editor)
-app.get("/api/users", auth("Admin", "Manager", "Editor"), (_req, res) => {
-  res.json(db.prepare("SELECT * FROM users ORDER BY created_at DESC").all());
-});
+  app.get("/api/users", auth("Editor", "Manager", "Admin"), (_req, res) => {
+    res.json(db.prepare("SELECT * FROM users ORDER BY created_at DESC, address").all());
+  });
 
-// CREATE / UPDATE user mana pun (Admin)
-app.put("/api/users/:address", auth("Admin"), (req, res) => {
+  app.put("/api/users/:address", auth("Admin"), (req, res) => {
+    upsert(walletAddress(req.params.address), req.body, res);
+  });
+
+  app.delete("/api/users/:address", auth("Admin"), (req, res) => {
+    const address = walletAddress(req.params.address);
+    if (address === req.user.address) return res.status(403).json({ error: "Admin hanya dapat menghapus profil pengguna lain." });
+    const result = db.prepare("DELETE FROM users WHERE address = ?").run(address);
+    res.json({ deleted: result.changes });
+  });
+
+  app.use((err, _req, res, _next) => {
+    if (err.type === "entity.parse.failed") return res.status(400).json({ error: "JSON tidak valid." });
+    if (err.type === "entity.too.large") return res.status(413).json({ error: "Isi permintaan terlalu besar." });
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    console.error("Kesalahan server:", err.message);
+    res.status(500).json({ error: "Terjadi kesalahan pada server." });
+  });
+  return app;
+}
+
+async function start() {
+  require("dotenv").config({ path: path.join(__dirname, ".env") });
+  const {
+    PORT = 4000,
+    JWT_SECRET,
+    FRONTEND_ORIGIN = "http://localhost:5173",
+  } = process.env;
+  if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error("Isi JWT_SECRET acak minimal 32 karakter di backend/.env.");
+
+  const deploymentFile = path.join(__dirname, "contract.json");
+  if (!fs.existsSync(deploymentFile)) throw new Error("backend/contract.json belum tersedia. Sinkronkan deployment sesuai README.");
+  const { address, abi, chainId, codeHash } = JSON.parse(fs.readFileSync(deploymentFile, "utf8"));
+  const deployment = { address: walletAddress(address), chainId, codeHash };
+  if (!Number.isSafeInteger(chainId) || chainId <= 0 || !ethers.isHexString(codeHash, 32)) {
+    throw new Error("Konfigurasi deployment tidak valid. Jalankan ulang sinkronisasi.");
+  }
+
+  const provider = new ethers.JsonRpcProvider(getDeploymentRpcUrl(chainId), undefined, { cacheTimeout: -1 });
   try {
-    const address = norm(req.params.address);
-    const [name, email, department] = fields(req.body);
-    db.prepare(`INSERT INTO users (address,name,email,department) VALUES (?,?,?,?)
-      ON CONFLICT(address) DO UPDATE SET name=?, email=?, department=?, updated_at=CURRENT_TIMESTAMP`)
-      .run(address, name, email, department, name, email, department);
-    res.json(db.prepare("SELECT * FROM users WHERE address=?").get(address));
-  } catch { res.status(400).json({ error: "Alamat tidak valid" }); }
-});
+    const code = await readDeploymentCode(provider, deployment.address, chainId);
+    if (ethers.keccak256(code) !== codeHash) {
+      throw new Error("Bytecode AssetRegistry tidak cocok. Periksa RPC dan sinkronkan deployment.");
+    }
+    const registry = new ethers.Contract(deployment.address, abi, provider);
+    const role = await registry.getRole(ethers.ZeroAddress).catch(() => {
+      throw new Error("Gagal membaca role AssetRegistry. Periksa RPC dan ABI deployment.");
+    });
+    if (role !== 0n) throw new Error("AssetRegistry tidak valid.");
 
-// DELETE profil user (Admin)
-app.delete("/api/users/:address", auth("Admin"), (req, res) => {
-  try {
-    const r = db.prepare("DELETE FROM users WHERE address=?").run(norm(req.params.address));
-    res.json({ deleted: r.changes });
-  } catch { res.status(400).json({ error: "Alamat tidak valid" }); }
-});
+    const db = new Database(path.join(__dirname, "data.db"));
+    const app = createApp({ db, registry, deployment, jwtSecret: JWT_SECRET, frontendOrigin: FRONTEND_ORIGIN });
+    app.listen(Number(PORT), "127.0.0.1", () => {
+      console.log("Backend jalan di http://127.0.0.1:" + PORT + " | AssetRegistry " + deployment.address + " | Chain " + chainId);
+    }).on("error", (error) => {
+      provider.destroy();
+      db.close();
+      console.error("Backend gagal berjalan:", error.message);
+      process.exitCode = 1;
+    });
+  } catch (error) {
+    provider.destroy();
+    throw error;
+  }
+}
 
-app.listen(PORT, () => console.log(`Backend jalan di http://localhost:${PORT}`));
+if (require.main === module) {
+  start().catch((error) => {
+    console.error("Backend gagal berjalan:", error.message);
+    process.exitCode = 1;
+  });
+}
+module.exports = { createApp };

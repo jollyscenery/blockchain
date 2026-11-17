@@ -6,6 +6,8 @@
     "node": "hardhat node",
     "compile": "hardhat compile",
     "test": "hardhat test",
+    "test:backend": "node --test backend/server.test.js",
+    "sync:remix": "node scripts/sync-remix-deployment.js",
     "deploy:local": "hardhat run scripts/deploy.js --network localhost",
     "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia"
   },
