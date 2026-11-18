@@ -61,7 +61,7 @@ async function challenge(wallet, signer = wallet) {
   assert.deepEqual(response.data.deployment, deployment);
   assert.ok(response.data.message.includes(wallet.address));
   assert.ok(response.data.message.includes(deployment.address));
-  return { address, signature: await signer.signMessage(response.data.message) };
+  return { address, signature: await signer.signMessage(response.data.message), nonce: response.data.nonce };
 }
 
 const submit = (body) => api("/api/auth/login", { method: "POST", body });
@@ -87,16 +87,16 @@ test("accepts wallet signatures, normalizes addresses and issues role-based sess
   assert.equal((await submit({ address: ethers.ZeroAddress })).status, 400);
 });
 
-test("rejects malformed, mismatched, replaced and expired signatures", async () => {
+test("rejects malformed, mismatched and expired signatures while preserving outstanding challenges", async () => {
   const mismatched = await challenge(viewer, editor);
   assert.equal((await submit(mismatched)).status, 401);
   assert.equal((await submit({ ...mismatched, signature: "invalid" })).status, 401);
   const replaced = await challenge(viewer);
   const current = await challenge(viewer);
-  assert.equal((await submit(replaced)).status, 401);
+  assert.equal((await submit(replaced)).status, 200);
   assert.equal((await submit(current)).status, 200);
   const expired = await challenge(viewer);
-  db.prepare("UPDATE nonces SET expires = ? WHERE address = ?").run(Date.now() - 1, viewer.address);
+  db.prepare("UPDATE login_challenges SET expires = ? WHERE address = ?").run(Date.now() - 1, viewer.address);
   assert.equal((await submit(expired)).status, 401);
 });
 
@@ -115,7 +115,11 @@ test("rejects missing, forged, expired and incorrectly scoped JWTs", async () =>
   const expired = jwt.sign(claims, jwtSecret, { ...options, expiresIn: -1 });
   const wrongAudience = jwt.sign(claims, jwtSecret, { ...options, audience: "another-deployment" });
   const wrongAlgorithm = jwt.sign(claims, jwtSecret, { ...options, algorithm: "HS384" });
-  for (const token of [undefined, forged, expired, wrongAudience, wrongAlgorithm]) {
+  const wrongIssuer = jwt.sign(claims, jwtSecret, { ...options, issuer: "another-application" });
+  const valid = jwt.sign(claims, jwtSecret, options).split(".");
+  const tampered = [valid[0], Buffer.from(JSON.stringify({ address: viewer.address })).toString("base64url"), valid[2]].join(".");
+  const unsigned = jwt.sign(claims, null, { ...options, algorithm: "none" });
+  for (const token of [undefined, forged, expired, wrongAudience, wrongAlgorithm, wrongIssuer, tampered, unsigned]) {
     assert.equal((await api("/api/users/me", { token })).status, 401);
   }
 });

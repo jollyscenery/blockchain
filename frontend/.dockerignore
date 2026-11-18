@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!index.html
+!vite.config.js
+!nginx.conf
+!src/
+src/**
+!src/App.jsx
+!src/main.jsx
+!src/styles.css
+!src/contract.json
+!src/ui.jsx
+!src/asset-reader.mjs

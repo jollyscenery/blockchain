@@ -1,16 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { BrowserProvider, Contract, getAddress, isAddress, keccak256, ZeroAddress } from "ethers";
+import { readAssetPage, ASSET_PAGE_SIZE, MAX_ASSET_TEXT_BYTES } from "./asset-reader.mjs";
+import { Icon, Badge, Dialog, EmptyState, Skeleton, Stat } from "./ui.jsx";
 
 const deployments = import.meta.glob("./contract.json", { eager: true, import: "default" });
 const info = deployments["./contract.json"];
 const networkLabel = info?.chainId === 11155111 ? "Sepolia (chain ID 11155111)" : `chain ID ${info?.chainId ?? 31337}`;
-const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:4000";
+const API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:4000";
 const ROLE = ["None", "Viewer", "Editor", "Manager", "Admin"];
 const EMPTY = { name: "", category: "", location: "", condition: "Baik", custodian: "" };
 const canReadUsers = (role) => ROLE.indexOf(role) >= 2;
 const validWallet = (address) => isAddress(address) && getAddress(address) !== ZeroAddress;
 const tag = (id) => "AST-" + String(id).padStart(4, "0");
 const short = (a) => a.slice(0, 6) + "…" + a.slice(-4);
+const date = (stamp) => new Date(Number(stamp) * 1000).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" });
+const explorer = (hash) => info?.chainId === 11155111 && /^0x[0-9a-f]{64}$/i.test(hash || "") ? `https://sepolia.etherscan.io/tx/${hash}` : null;
 
 async function request(path, options = {}, token) {
   const headers = {};
@@ -38,8 +42,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState(false);
   const walletVersion = useRef(0);
+  const transactionLock = useRef(false);
 
-  const notify = useCallback((text, type = "ok") => setMsg({ text, type }), []);
+  const notify = useCallback((text, type = "ok", hash = null) => setMsg({ text, type, hash }), []);
   const fail = useCallback((error) => {
     if (error?.name === "AbortError") return;
     const rejected = error?.code === "ACTION_REJECTED" || error?.code === 4001;
@@ -116,26 +121,39 @@ export default function App() {
   }, [token, resetSession]);
 
   async function transact(send, success) {
-    if (pending) return false;
+    if (transactionLock.current) return false;
+    transactionLock.current = true;
     const version = walletVersion.current;
     setPending(true);
     notify("Konfirmasi transaksi di MetaMask.");
     try {
+      const [chainId, accounts] = await Promise.all([
+        window.ethereum.request({ method: "eth_chainId" }),
+        window.ethereum.request({ method: "eth_accounts" }),
+      ]);
+      if (Number(BigInt(chainId)) !== info.chainId || !accounts[0] ||
+          getAddress(accounts[0]) !== session.address || version !== walletVersion.current) {
+        resetSession("Akun atau jaringan berubah. Masuk kembali dengan wallet yang sesuai.");
+        return false;
+      }
       const tx = await send();
-      if (version === walletVersion.current) notify("Menunggu konfirmasi blockchain…");
+      let hash = tx.hash;
+      if (version === walletVersion.current) notify("Menunggu konfirmasi blockchain…", "progress", hash);
       try {
         await tx.wait();
       } catch (error) {
         if (error.code !== "TRANSACTION_REPLACED" || error.cancelled || error.receipt?.status !== 1) throw error;
+        hash = error.replacement?.hash || error.receipt.hash || hash;
       }
       if (version !== walletVersion.current) return false;
-      notify(success);
+      notify(success, "ok", hash);
       return true;
     } catch (error) {
       if (version === walletVersion.current) fail(error);
       return false;
     } finally {
       setPending(false);
+      transactionLock.current = false;
     }
   }
 
@@ -171,7 +189,7 @@ export default function App() {
       if (version !== walletVersion.current) return;
       const data = await request("/api/auth/login", {
         method: "POST",
-        body: JSON.stringify({ address, signature }),
+        body: JSON.stringify({ address, signature, nonce: challenge.nonce }),
       });
       if (version !== walletVersion.current) return;
       const contract = new Contract(info.address, info.abi, signer);
@@ -183,14 +201,31 @@ export default function App() {
     }
   }
 
+  async function switchNetwork() {
+    try {
+      if (!window.ethereum) throw new Error("MetaMask belum terpasang.");
+      await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x" + info.chainId.toString(16) }] });
+      notify("Jaringan dipilih. Silakan masuk dengan MetaMask.");
+    } catch (error) { fail(error); }
+  }
+
   if (!session) {
     return (
-      <div className="login"><div className="box">
-        <h1>Buku Aset</h1>
-        <p className="sub">Catatan aset kantor yang tersimpan di blockchain dan tidak bisa diubah diam-diam.</p>
-        {msg && <div className={`msg ${msg.type}`} role="alert">{msg.text}</div>}
-        <button className="btn" onClick={login} disabled={busy}>{busy ? "Menunggu MetaMask…" : "Masuk dengan MetaMask"}</button>
-      </div></div>
+      <div className="login">
+        <section className="login-story"><div className="brand"><span className="brand-mark"><Icon name="assets" size={25} /></span><div>Buku Aset<small>ASSET MANAGEMENT</small></div></div>
+          <div className="story-content"><span className="eyebrow">TRANSPARAN. TERLACAK. TERKELOLA.</span><h1>Setiap aset,<br />punya cerita<br /><span>yang tercatat.</span></h1><p>Kelola inventaris dengan catatan blockchain yang dapat diverifikasi. Satu tempat untuk aset dan tanggung jawab tim Anda.</p>
+            <div className="story-feature"><Icon name="roles" /><span>Empat role. Akses sesuai tanggung jawab.</span></div><div className="story-feature"><Icon name="clock" /><span>Riwayat perubahan tersimpan di Ethereum.</span></div></div>
+          <small className="story-footer">BINUS University · Blockchain Fundamental</small>
+        </section>
+        <section className="login-main"><div className="box"><Badge tone="green"><span className="status-dot" />{info?.chainId === 11155111 ? "Ethereum Sepolia" : "Hardhat Local"}</Badge><h2>Selamat datang.</h2><p className="sub">Hubungkan wallet untuk mengakses ruang kerja aset Anda.</p>
+          <div className="wallet-tile"><span className="wallet-symbol"><Icon name="wallet" size={27} /></span><div><strong>Masuk dengan wallet</strong><small>Tanda tangan pesan, tanpa biaya gas.</small></div></div>
+          {msg && <div className={`msg ${msg.type}`} role="alert">{msg.text}</div>}
+          <button className="btn login-action" onClick={login} disabled={busy}><Icon name="wallet" />{busy ? "Menunggu MetaMask…" : "Masuk dengan MetaMask"}<Icon name="arrow" size={18} /></button>
+          <button className="text-button network-switch" onClick={switchNetwork} disabled={busy}>Pilih {info?.chainId === 11155111 ? "Sepolia" : "Hardhat Local"} di MetaMask</button>
+          <p className="login-note"><Icon name="roles" size={17} />Wallet harus memiliki role dari Admin. Gunakan alamat publik untuk meminta akses.</p>
+          <div className="deployment-note"><span>SMART CONTRACT</span><code>{info?.address}</code><small>Chain ID {info?.chainId} · Private key tetap di wallet Anda</small></div>
+        </div><small className="login-copyright">Buku Aset / Phase 1</small></section>
+      </div>
     );
   }
 
@@ -202,275 +237,171 @@ export default function App() {
   return (
     <div className="shell">
       <aside className="side">
-        <div className="brand">Buku Aset<small>Asset Logging dApp</small></div>
-        <nav className="nav">
+        <div className="brand"><span className="brand-mark"><Icon name="assets" size={24} /></span><div>Buku Aset<small>ASSET MANAGEMENT</small></div></div>
+        <div className="nav-label">RUANG KERJA</div>
+        <nav className="nav" aria-label="Navigasi utama">
           {tabs.map(([k, l]) => (
-            <button key={k} disabled={pending} aria-current={tab === k} onClick={() => { setTab(k); setMsg(null); }}>{l}</button>
+            <button key={k} disabled={pending} aria-current={tab === k ? "page" : undefined} onClick={() => { setTab(k); setMsg(null); }}><Icon name={k} />{l}{tab === k && <span className="nav-dot" />}</button>
           ))}
         </nav>
-        <div className="me"><b>{role}</b><br />{session.address}<br />
-          <button className="btn ghost" style={{ marginTop: 10, color: "#e9eef2", borderColor: "#5c6b7a" }} onClick={() => resetSession()}>Keluar</button>
-        </div>
+        <div className="sidebar-note"><Icon name="roles" /><strong>Catatan yang bisa dipercaya</strong><p>Perubahan aset diverifikasi melalui transaksi blockchain.</p></div>
+        <div className="me"><span className="avatar">{role.slice(0, 1)}</span><div><strong>{role}</strong><code title={session.address}>{short(session.address)}</code></div><button className="icon-button" aria-label="Keluar" onClick={() => resetSession()}><Icon name="logout" size={18} /></button></div>
       </aside>
-      <main className="main">
-        {msg && <div className={`msg ${msg.type}`} role="status">{msg.text}</div>}
-        {tab === "assets" && <Assets contract={contract} role={role} pending={pending} transact={transact} notify={notify} fail={sessionFail} />}
-        {tab === "profile" && <Profile api={api} notify={notify} fail={sessionFail} />}
-        {tab === "users" && canReadUsers(role) && <Users api={api} me={session.address} role={role} notify={notify} fail={sessionFail} />}
-        {tab === "roles" && role === "Admin" && <Roles contract={contract} me={session.address} pending={pending} transact={transact} notify={notify} fail={sessionFail} />}
-      </main>
+      <div className="workspace"><header className="topbar"><div className="breadcrumb">Ruang kerja <span>/</span> <strong>{tabs.find(([k]) => k === tab)?.[1]}</strong></div><div className="connection"><Badge tone="green"><span className="status-dot" />{info.chainId === 11155111 ? "Sepolia" : "Hardhat Local"}</Badge><Badge tone="blue">{role}</Badge><span className="wallet-address" title={session.address}><Icon name="wallet" size={16} />{short(session.address)}</span></div></header>
+        <main className="main" key={session.address + ":" + session.version}>
+          {tab === "assets" && <Assets contract={contract} role={role} pending={pending} transact={transact} notify={notify} fail={sessionFail} />}
+          {tab === "profile" && <Profile api={api} notify={notify} fail={sessionFail} />}
+          {tab === "users" && canReadUsers(role) && <Users api={api} me={session.address} role={role} notify={notify} fail={sessionFail} />}
+          {tab === "roles" && role === "Admin" && <Roles contract={contract} me={session.address} pending={pending} transact={transact} notify={notify} fail={sessionFail} />}
+        </main><footer className="workspace-footer">Buku Aset <span>On-chain assets. Off-chain profiles.</span></footer>
+      </div>
+      {msg && <div className={`toast ${msg.type}`} role={msg.type === "err" ? "alert" : "status"}><span className="toast-icon"><Icon name={pending ? "clock" : msg.type === "err" ? "close" : "check"} /></span><div>{msg.text}{explorer(msg.hash) && <a href={explorer(msg.hash)} target="_blank" rel="noopener noreferrer">Lihat transaksi di Etherscan <Icon name="arrow" size={13} /></a>}</div><button className="icon-button" aria-label="Tutup notifikasi" onClick={() => setMsg(null)}><Icon name="close" size={17} /></button></div>}
     </div>
   );
 }
 
-/* ---------------- On-chain: aset ---------------- */
+
+/* ---------------- On-chain: bounded legacy reads ---------------- */
 function Assets({ contract, role, pending, transact, notify, fail }) {
-  const [items, setItems] = useState(null);
-  const [form, setForm] = useState(EMPTY);
-  const [editId, setEditId] = useState(null);
+  const [page, setPage] = useState(null);
+  const [cursor, setCursor] = useState(0n);
+  const [reload, setReload] = useState(0);
+  const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [form, setForm] = useState(null);
+  const [editId, setEditId] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [deleting, setDeleting] = useState(null);
+  const [query, setQuery] = useState("");
+  const [condition, setCondition] = useState("");
   const canWrite = ["Admin", "Manager", "Editor"].includes(role);
   const canDelete = role === "Admin" || role === "Manager";
-
-  const load = useCallback(async () => {
-    setLoadFailed(false);
-    try {
-      setItems((await contract.getAllAssets()).map((a) => a.toObject()));
-    } catch (error) {
-      setLoadFailed(true);
-      fail(error);
-    }
-  }, [contract, fail]);
-  useEffect(() => { load(); }, [load]);
-
-  function resetForm() {
-    setForm(EMPTY);
-    setEditId(null);
-  }
-
-  async function submit(e) {
-    e.preventDefault();
+  const refresh = () => setReload((value) => value + 1);
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true); setLoadFailed(false);
+    readAssetPage(contract, cursor, ASSET_PAGE_SIZE, controller.signal).then((data) => {
+      if (!controller.signal.aborted) setPage(data);
+    }).catch((error) => {
+      if (!controller.signal.aborted) { setLoadFailed(true); fail(error); }
+    }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [contract, cursor, reload, fail]);
+  const items = page?.items || [];
+  const filtered = items.filter((asset) => [asset.name, asset.category, asset.location, asset.custodian, tag(asset.id)].some((v) => v.toLowerCase().includes(query.toLowerCase())) && (!condition || asset.condition === condition));
+  async function submit(event) {
+    event.preventDefault();
     const fields = [form.name, form.category, form.location, form.condition].map((value) => value.trim());
     if (fields.some((value) => !value)) return notify("Lengkapi nama, kategori, lokasi, dan kondisi.", "err");
+    if (fields.some((value) => new TextEncoder().encode(value).length > MAX_ASSET_TEXT_BYTES)) return notify("Setiap field aset maksimal 256 byte UTF-8. Persingkat teks Anda.", "err");
     const custodian = form.custodian.trim();
     if (!validWallet(custodian)) return notify("Alamat penanggung jawab belum valid.", "err");
-    const args = [...fields, custodian];
     const created = editId === null;
-    const saved = await transact(
-      () => created ? contract.createAsset(...args) : contract.updateAsset(editId, ...args),
-      created ? "Aset ditambahkan." : "Aset diperbarui.",
-    );
-    if (saved) { resetForm(); await load(); }
-  }
-
-  async function remove(id) {
-    if (!confirm(`Hapus ${tag(id)}? Aset disembunyikan, riwayatnya tetap ada di blockchain.`)) return;
-    if (await transact(() => contract.deleteAsset(id), "Aset dihapus.")) {
-      if (id === editId) resetForm();
-      await load();
+    if (await transact(() => created ? contract.createAsset(...fields, custodian) : contract.updateAsset(editId, ...fields, custodian), created ? "Aset ditambahkan." : "Aset diperbarui.")) {
+      setForm(null); refresh();
     }
   }
-
-  const conditions = ["Baik", "Perlu perbaikan", "Rusak"];
-  if (!conditions.includes(form.condition)) conditions.push(form.condition);
-  return (<>
-    <h1>Aset</h1>
-    <p className="sub">Setiap perubahan dicatat sebagai transaksi di blockchain.</p>
-    {canWrite && (
-      <form className="card" onSubmit={submit}>
-        <strong>{editId === null ? "Tambah aset" : `Ubah ${tag(editId)}`}</strong>
-        <label>Nama aset<input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
-        <div className="row">
-          <label style={{ flex: 1 }}>Kategori<input required value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} /></label>
-          <label style={{ flex: 1 }}>Lokasi<input required value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} /></label>
-        </div>
-        <label>Kondisi
-          <select aria-label="Kondisi" value={form.condition} onChange={(e) => setForm({ ...form, condition: e.target.value })}>
-            {conditions.map((c) => <option key={c}>{c}</option>)}
-          </select>
-        </label>
-        <label>Alamat wallet penanggung jawab<input required placeholder="0x…" value={form.custodian} onChange={(e) => setForm({ ...form, custodian: e.target.value })} /></label>
-        <div className="row">
-          <button className="btn" disabled={pending}>{editId === null ? "Simpan aset" : "Simpan perubahan"}</button>
-          {editId !== null && <button type="button" className="btn ghost" disabled={pending} onClick={resetForm}>Batal</button>}
-        </div>
-      </form>
-    )}
-    <div className="bar"><button className="btn ghost" disabled={pending} onClick={load}>Muat ulang aset</button></div>
-    <div className="sheet">
-      {loadFailed ? <div className="empty">Daftar aset gagal dimuat.</div> :
-        items === null ? <div className="empty">Memuat dari blockchain…</div> :
-        items.length === 0 ? <div className="empty">Belum ada aset.{canWrite && " Tambahkan aset pertama lewat formulir di atas."}</div> : (
-        <table>
-          <thead><tr><th>Tag</th><th>Nama</th><th>Kategori</th><th>Lokasi</th><th>Kondisi</th><th>Penanggung jawab</th>{canWrite && <th></th>}</tr></thead>
-          <tbody>{items.map((a) => (
-            <tr key={a.id.toString()}>
-              <td><span className="tagid">{tag(a.id)}</span></td>
-              <td>{a.name}</td><td>{a.category}</td><td>{a.location}</td><td>{a.condition}</td>
-              <td className="addr" title={a.custodian}>{short(a.custodian)}</td>
-              {canWrite && <td><div className="acts">
-                <button className="btn ghost" disabled={pending} onClick={() => { setEditId(a.id); setForm({ name: a.name, category: a.category, location: a.location, condition: a.condition, custodian: a.custodian }); window.scrollTo(0, 0); }}>Ubah</button>
-                {canDelete && <button className="btn danger" disabled={pending} onClick={() => remove(a.id)}>Hapus</button>}
-              </div></td>}
-            </tr>))}
-          </tbody>
-        </table>)}
-    </div>
-  </>);
+  async function remove() {
+    if (await transact(() => contract.deleteAsset(deleting.id), "Aset dihapus.")) { setDeleting(null); refresh(); }
+  }
+  const conditions = [...new Set(["Baik", "Perlu perbaikan", "Rusak", ...(form ? [form.condition] : [])])];
+  return <>
+    <div className="page-heading"><div><span className="eyebrow">INVENTARIS ON-CHAIN</span><h1>Ikhtisar aset</h1><p className="sub">Aset tertata. Setiap perubahan punya jejak.</p></div>{canWrite && <button className="btn" disabled={pending} onClick={() => { setEditId(null); setForm({ ...EMPTY }); }}><Icon name="plus" size={18} />Tambah aset</button>}</div>
+    <div className="stats"><Stat label="Aset aktif" value={page ? items.length : "—"} note="Dalam rentang halaman ini" /><Stat label="Total ID riwayat" value={page ? page.total.toString() : "—"} note="Termasuk aset yang dihapus" icon="clock" /><Stat label="Perlu perhatian" value={page ? items.filter((a) => a.condition !== "Baik").length : "—"} note="Kondisi selain Baik di halaman ini" icon="roles" /></div>
+    <section className="panel"><div className="panel-heading"><div><h2>Daftar aset</h2><p>Data langsung dari {info.chainId === 11155111 ? "Ethereum Sepolia" : "Hardhat Local"}.</p></div><button className="btn ghost" disabled={pending || loading} onClick={refresh}><Icon name="refresh" size={16} />Muat ulang aset</button></div>
+      <div className="table-toolbar"><label className="search"><Icon name="search" size={18} /><input aria-label="Cari aset di halaman ini" placeholder="Cari nama, tag, atau lokasi…" value={query} onChange={(e) => setQuery(e.target.value)} /></label><select aria-label="Filter kondisi" value={condition} onChange={(e) => setCondition(e.target.value)}><option value="">Semua kondisi</option>{conditions.map((c) => <option key={c}>{c}</option>)}</select></div>
+      <div className="sheet">
+        {loading ? <Skeleton label="Memuat aset dari blockchain…" /> : loadFailed ? <EmptyState title="Data belum dapat dimuat" action={<button className="btn ghost" onClick={refresh}>Coba lagi</button>}>Periksa jaringan dan koneksi RPC Anda.</EmptyState> : filtered.length === 0 ? <EmptyState title={items.length ? "Tidak ada hasil yang cocok" : "Belum ada aset aktif di rentang ini"}>{items.length ? "Ubah pencarian atau filter kondisi." : "Rentang berikutnya mungkin memuat aset lain. Aset yang dihapus tetap memiliki riwayat."}</EmptyState> : <table className="assets-table">
+          <thead><tr><th scope="col">Aset</th><th scope="col">Kategori</th><th scope="col">Lokasi</th><th scope="col">Kondisi</th><th scope="col">Penanggung jawab</th><th scope="col">Aksi</th></tr></thead><tbody>{filtered.map((asset) => <tr key={asset.id.toString()}>
+            <td><div className="asset-cell"><span className="asset-symbol"><Icon name="assets" size={19} /></span><div><button className="asset-name" onClick={() => setDetail(asset)}>{asset.name}</button><small>{tag(asset.id)}</small></div></div></td><td data-label="Kategori"><span className="category">{asset.category}</span></td><td data-label="Lokasi">{asset.location}</td><td data-label="Kondisi"><Badge tone={asset.condition === "Baik" ? "green" : asset.condition === "Rusak" ? "red" : "amber"}>{asset.condition}</Badge></td><td data-label="Penanggung jawab" className="addr" title={asset.custodian}>{short(asset.custodian)}</td>
+            <td><div className="acts"><button className="text-button" onClick={() => setDetail(asset)}>Detail</button>{canWrite && <button className="icon-button" aria-label={`Ubah ${tag(asset.id)}`} disabled={pending} onClick={() => { setEditId(asset.id); setForm({ name: asset.name, category: asset.category, location: asset.location, condition: asset.condition, custodian: asset.custodian }); }}><Icon name="edit" size={17} /></button>}{canDelete && <button className="icon-button danger-text" aria-label={`Hapus ${tag(asset.id)}`} disabled={pending} onClick={() => setDeleting(asset)}><Icon name="trash" size={17} /></button>}</div></td>
+          </tr>)}</tbody></table>}
+      </div>
+      <div className="pagination"><span>{page && page.total > 0n ? `ID ${cursor}–${page.end > cursor ? page.end - 1n : cursor} dari ${page.total} ID riwayat` : "Belum ada riwayat aset"}<small>Pencarian dan statistik berlaku pada halaman ini.</small></span><div className="acts"><button className="btn ghost" disabled={loading || pending || cursor === 0n} onClick={() => setCursor(cursor - BigInt(ASSET_PAGE_SIZE))}>Sebelumnya</button><button className="btn ghost" disabled={loading || pending || !page || page.end >= page.total} onClick={() => setCursor(cursor + BigInt(ASSET_PAGE_SIZE))}>Berikutnya</button></div></div>
+    </section>
+    <p className="integrity-note"><Icon name="roles" size={16} />Catatan blockchain dapat diverifikasi. Penghapusan aset bersifat soft delete.</p>
+    {form && canWrite && <Dialog title={editId === null ? "Tambah aset" : `Ubah ${tag(editId)}`} onClose={() => setForm(null)} busy={pending}><p className="sub">Perubahan memerlukan konfirmasi transaksi di MetaMask.</p><form onSubmit={submit} className="form-grid"><fieldset disabled={pending}>
+      <label>Nama aset<input required autoFocus maxLength={256} placeholder="Contoh: MacBook Pro 14 inci" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label><div className="field-row"><label>Kategori<input required maxLength={256} placeholder="Contoh: Perangkat IT" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} /></label><label>Lokasi<input required maxLength={256} placeholder="Contoh: Ruang 301" value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} /></label></div>
+      <label>Kondisi<select aria-label="Kondisi" value={form.condition} onChange={(e) => setForm({ ...form, condition: e.target.value })}>{conditions.map((c) => <option key={c}>{c}</option>)}</select></label><label>Alamat wallet penanggung jawab<input required spellCheck="false" placeholder="0x…" value={form.custodian} onChange={(e) => setForm({ ...form, custodian: e.target.value })} /></label><small className="field-hint">Maksimal 256 byte per field teks. Alamat harus valid dan bukan zero address.</small>
+      <div className="dialog-actions"><button type="button" className="btn ghost" onClick={() => setForm(null)}>Batal</button><button className="btn">{pending ? "Menunggu transaksi…" : editId === null ? "Simpan aset" : "Simpan perubahan"}</button></div>
+    </fieldset></form></Dialog>}
+    {detail && <Dialog title={tag(detail.id)} onClose={() => setDetail(null)}><h3 className="detail-title">{detail.name}</h3><dl className="details">{[["Kategori", detail.category], ["Lokasi", detail.location], ["Kondisi", detail.condition], ["Penanggung jawab", detail.custodian], ["Dibuat oleh", detail.createdBy], ["Dibuat pada", date(detail.createdAt)], ["Diperbarui pada", date(detail.updatedAt)]].map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl></Dialog>}
+    {deleting && canDelete && <Dialog title="Hapus aset?" busy={pending} onClose={() => setDeleting(null)}><p>{tag(deleting.id)} — {deleting.name} akan disembunyikan dari daftar aktif. Riwayat tetap ada di blockchain.</p><div className="dialog-actions"><button className="btn ghost" disabled={pending} onClick={() => setDeleting(null)}>Batal</button><button className="btn danger" disabled={pending} onClick={remove}>Konfirmasi hapus</button></div></Dialog>}
+  </>;
 }
 
-/* ---------------- Off-chain: profil ---------------- */
-const profileFields = ({ name, email, department } = {}) => ({
-  name: name || "", email: email || "", department: department || "",
-});
-
+/* ---------------- Off-chain: profiles ---------------- */
+const profileFields = ({ name, email, department } = {}) => ({ name: name || "", email: email || "", department: department || "" });
 function ProfileFields({ values, change, disabled }) {
-  return (<>
-    <label>Nama<input required maxLength={120} disabled={disabled} value={values.name} onChange={(e) => change({ ...values, name: e.target.value })} /></label>
-    <label>Email<input required maxLength={254} disabled={disabled} type="email" value={values.email} onChange={(e) => change({ ...values, email: e.target.value })} /></label>
-    <label>Departemen<input required maxLength={120} disabled={disabled} value={values.department} onChange={(e) => change({ ...values, department: e.target.value })} /></label>
-  </>);
+  return <fieldset disabled={disabled}><label>Nama lengkap<input required maxLength={120} value={values.name} onChange={(e) => change({ ...values, name: e.target.value })} /></label><label>Email<input required maxLength={254} type="email" value={values.email} onChange={(e) => change({ ...values, email: e.target.value })} /></label><label>Departemen<input required maxLength={120} value={values.department} onChange={(e) => change({ ...values, department: e.target.value })} /></label></fieldset>;
 }
-
 function Profile({ api, notify, fail }) {
   const [values, setValues] = useState(null);
   const [busy, setBusy] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const load = useCallback(async () => {
     setLoadFailed(false);
-    try { setValues(profileFields(await api("/api/users/me"))); }
-    catch (error) { setLoadFailed(true); fail(error); }
+    try { setValues(profileFields(await api("/api/users/me"))); } catch (error) { setLoadFailed(true); fail(error); }
   }, [api, fail]);
   useEffect(() => { load(); }, [load]);
-
-  async function save(e) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      const saved = await api("/api/users/me", { method: "PUT", body: JSON.stringify(values) });
-      setValues(profileFields(saved));
-      notify("Profil disimpan.");
-    } catch (error) { fail(error); }
-    finally { setBusy(false); }
+  async function save(event) {
+    event.preventDefault(); setBusy(true);
+    try { setValues(profileFields(await api("/api/users/me", { method: "PUT", body: JSON.stringify(values) }))); notify("Profil disimpan."); }
+    catch (error) { fail(error); } finally { setBusy(false); }
   }
-  return (<>
-    <h1>Profil saya</h1>
-    <p className="sub">Profil disimpan di database SQLite aplikasi.</p>
-    {loadFailed ? <button className="btn ghost" onClick={load}>Muat ulang profil</button> :
-      values === null ? <div className="empty">Memuat profil…</div> :
-      <form className="card" onSubmit={save}>
-        <ProfileFields values={values} change={setValues} disabled={busy} />
-        <div><button className="btn" disabled={busy}>Simpan profil</button></div>
-      </form>}
-  </>);
+  return <><div className="page-heading"><div><span className="eyebrow">AKUN ANDA</span><h1>Profil saya</h1><p className="sub">Informasi pribadi untuk melengkapi ruang kerja Anda.</p></div><Badge tone="blue">Off-chain · SQLite</Badge></div><div className="profile-layout"><section className="panel"><div className="panel-heading"><div><h2>Informasi profil</h2><p>Perubahan profil tidak memerlukan transaksi blockchain.</p></div></div>{loadFailed ? <EmptyState title="Profil gagal dimuat" action={<button className="btn ghost" onClick={load}>Muat ulang profil</button>} /> : values === null ? <Skeleton /> : <form className="profile-form" onSubmit={save}><ProfileFields values={values} change={setValues} disabled={busy} /><div className="form-footer"><small>Disimpan di database aplikasi.</small><button className="btn" disabled={busy}>{busy ? "Menyimpan…" : "Simpan profil"}</button></div></form>}</section><aside className="info-card"><Icon name="roles" size={25} /><h3>Wallet adalah identitas Anda</h3><p>Alamat wallet terikat pada sesi login. Mengubah profil tidak mengubah role atau kepemilikan wallet.</p><p>Data profil tersimpan pada volume SQLite dan tetap tersedia setelah container dimulai ulang.</p></aside></div></>;
 }
-
-/* ---------------- Off-chain: daftar user ---------------- */
 function Users({ api, me, role, notify, fail }) {
   const [rows, setRows] = useState(null);
   const [editing, setEditing] = useState(null);
+  const [deleting, setDeleting] = useState(null);
+  const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const load = useCallback(async () => {
     setLoadFailed(false);
-    try { setRows(await api("/api/users")); }
-    catch (error) { setLoadFailed(true); fail(error); }
+    try { setRows(await api("/api/users")); } catch (error) { setLoadFailed(true); fail(error); }
   }, [api, fail]);
   useEffect(() => { load(); }, [load]);
-
-  async function del(a) {
-    if (!confirm("Hapus data profil ini? Role di blockchain tidak berubah.")) return;
+  async function remove() {
     setBusy(true);
-    try {
-      await api(`/api/users/${a}`, { method: "DELETE" });
-      if (editing?.address === a) setEditing(null);
-      notify("Profil dihapus.");
-      await load();
-    } catch (error) { fail(error); }
-    finally { setBusy(false); }
+    try { await api(`/api/users/${deleting.address}`, { method: "DELETE" }); setDeleting(null); notify("Profil dihapus."); await load(); }
+    catch (error) { fail(error); } finally { setBusy(false); }
   }
-
-  async function save(e) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await api(`/api/users/${editing.address}`, { method: "PUT", body: JSON.stringify(editing.values) });
-      setEditing(null);
-      notify("Profil diperbarui.");
-      await load();
-    } catch (error) { fail(error); }
-    finally { setBusy(false); }
+  async function save(event) {
+    event.preventDefault(); setBusy(true);
+    try { await api(`/api/users/${editing.address}`, { method: "PUT", body: JSON.stringify(editing.values) }); setEditing(null); notify("Profil diperbarui."); await load(); }
+    catch (error) { fail(error); } finally { setBusy(false); }
   }
-  return (<>
-    <h1>Data pengguna</h1>
-    <p className="sub">Profil yang diisi pengguna di database aplikasi.</p>
-    {role === "Admin" && editing && <form className="card" onSubmit={save}>
-      <strong>Ubah profil {short(editing.address)}</strong>
-      <ProfileFields values={editing.values} disabled={busy} change={(values) => setEditing({ ...editing, values })} />
-      <div className="row">
-        <button className="btn" disabled={busy}>Simpan perubahan profil</button>
-        <button className="btn ghost" type="button" disabled={busy} onClick={() => setEditing(null)}>Batal</button>
-      </div>
-    </form>}
-    <div className="sheet">
-      {loadFailed ? <div className="empty"><button className="btn ghost" onClick={load}>Muat ulang data pengguna</button></div> :
-        rows === null ? <div className="empty">Memuat…</div> : rows.length === 0 ? <div className="empty">Belum ada pengguna yang mengisi profil.</div> : (
-        <table><thead><tr><th>Wallet</th><th>Nama</th><th>Email</th><th>Departemen</th>{role === "Admin" && <th></th>}</tr></thead>
-          <tbody>{rows.map((u) => (<tr key={u.address}>
-            <td className="addr" title={u.address}>{short(u.address)}</td><td>{u.name}</td><td>{u.email}</td><td>{u.department}</td>
-            {role === "Admin" && <td>{me !== u.address && <div className="acts">
-              <button className="btn ghost" disabled={busy} onClick={() => setEditing({ address: u.address, values: profileFields(u) })}>Ubah</button>
-              <button className="btn danger" disabled={busy} onClick={() => del(u.address)}>Hapus</button></div>}</td>}
-          </tr>))}</tbody></table>)}
-    </div>
-  </>);
+  const filtered = (rows || []).filter((u) => [u.address, u.name, u.email, u.department].some((v) => (v || "").toLowerCase().includes(query.toLowerCase())));
+  return <><div className="page-heading"><div><span className="eyebrow">DIREKTORI TIM</span><h1>Data pengguna</h1><p className="sub">Profil yang dibagikan pengguna di aplikasi.</p></div><Badge>{rows?.length ?? "—"} profil</Badge></div><section className="panel"><div className="table-toolbar"><label className="search"><Icon name="search" size={18} /><input placeholder="Cari pengguna…" aria-label="Cari pengguna" value={query} onChange={(e) => setQuery(e.target.value)} /></label></div><div className="sheet">{loadFailed ? <EmptyState title="Data gagal dimuat" action={<button className="btn ghost" onClick={load}>Muat ulang data pengguna</button>} /> : rows === null ? <Skeleton /> : !filtered.length ? <EmptyState title="Belum ada profil yang cocok" icon="users">Profil akan muncul setelah pengguna menyimpannya.</EmptyState> : <table><thead><tr><th>Pengguna</th><th>Email</th><th>Departemen</th><th>Wallet</th>{role === "Admin" && <th>Aksi</th>}</tr></thead><tbody>{filtered.map((user) => <tr key={user.address}><td><strong>{user.name}</strong></td><td>{user.email}</td><td>{user.department}</td><td className="addr" title={user.address}>{short(user.address)}</td>{role === "Admin" && <td>{me.toLowerCase() !== user.address.toLowerCase() && <div className="acts"><button className="icon-button" aria-label={`Ubah profil ${user.name}`} disabled={busy} onClick={() => setEditing({ address: user.address, values: profileFields(user) })}><Icon name="edit" size={17} /></button><button className="icon-button danger-text" aria-label={`Hapus profil ${user.name}`} disabled={busy} onClick={() => setDeleting(user)}><Icon name="trash" size={17} /></button></div>}</td>}</tr>)}</tbody></table>}</div></section>
+    {role === "Admin" && editing && <Dialog title="Ubah profil pengguna" busy={busy} onClose={() => setEditing(null)}><p className="addr">{editing.address}</p><form className="form-grid" onSubmit={save}><ProfileFields values={editing.values} disabled={busy} change={(values) => setEditing({ ...editing, values })} /><div className="dialog-actions"><button className="btn ghost" type="button" disabled={busy} onClick={() => setEditing(null)}>Batal</button><button className="btn" disabled={busy}>Simpan perubahan profil</button></div></form></Dialog>}
+    {role === "Admin" && deleting && <Dialog title="Hapus profil pengguna?" busy={busy} onClose={() => setDeleting(null)}><p>Profil {deleting.name} di SQLite akan dihapus. Role di blockchain tidak berubah.</p><div className="dialog-actions"><button className="btn ghost" disabled={busy} onClick={() => setDeleting(null)}>Batal</button><button className="btn danger" disabled={busy} onClick={remove}>Konfirmasi hapus profil</button></div></Dialog>}
+  </>;
 }
 
-/* ---------------- On-chain: role (Admin) ---------------- */
+/* ---------------- On-chain: Admin roles ---------------- */
 function Roles({ contract, me, pending, transact, notify, fail }) {
   const [list, setList] = useState(null);
   const [addr, setAddr] = useState("");
   const [role, setRole] = useState("1");
+  const [revoking, setRevoking] = useState(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const load = useCallback(async () => {
     setLoadFailed(false);
-    try {
-      const [addresses, roles] = await contract.getMembers();
-      setList(addresses.map((address, i) => ({ address, role: Number(roles[i]) })).filter((member) => member.role > 0));
-    } catch (error) { setLoadFailed(true); fail(error); }
+    try { const [addresses, roles] = await contract.getMembers(); setList(addresses.map((address, i) => ({ address, role: Number(roles[i]) })).filter((member) => member.role > 0)); }
+    catch (error) { setLoadFailed(true); fail(error); }
   }, [contract, fail]);
   useEffect(() => { load(); }, [load]);
-
-  async function assign(e) {
-    e.preventDefault();
-    const address = addr.trim();
+  async function assign(event) {
+    event.preventDefault(); const address = addr.trim();
     if (!validWallet(address)) return notify("Alamat wallet belum valid.", "err");
-    if (await transact(() => contract.setRole(address, Number(role)), "Role disimpan.")) {
-      setAddr("");
-      await load();
-    }
+    if (await transact(() => contract.setRole(address, Number(role)), "Role disimpan.")) { setAddr(""); await load(); }
   }
-
-  async function revoke(address) {
-    if (await transact(() => contract.revokeRole(address), "Role dicabut.")) await load();
+  async function revoke() {
+    if (await transact(() => contract.revokeRole(revoking), "Role dicabut.")) { setRevoking(null); await load(); }
   }
-  return (<>
-    <h1>Kelola role</h1>
-    <p className="sub">Role disimpan di smart contract dan berlaku langsung setelah transaksi dikonfirmasi.</p>
-    <form className="card" onSubmit={assign}>
-      <label>Alamat wallet<input required placeholder="0x…" value={addr} onChange={(e) => setAddr(e.target.value)} /></label>
-      <label>Role<select aria-label="Role" value={role} onChange={(e) => setRole(e.target.value)}><option value="1">Viewer</option><option value="2">Editor</option><option value="3">Manager</option><option value="4">Admin</option></select></label>
-      <div><button className="btn" disabled={pending}>Simpan role</button></div>
-    </form>
-    <div className="sheet">
-      {loadFailed ? <div className="empty"><button className="btn ghost" onClick={load}>Muat ulang role</button></div> :
-        list === null ? <div className="empty">Memuat…</div> : (
-        <table><thead><tr><th>Wallet</th><th>Role</th><th></th></tr></thead>
-          <tbody>{list.map((m) => (<tr key={m.address}>
-            <td className="addr">{m.address}{m.address.toLowerCase() === me.toLowerCase() && " (Anda)"}</td>
-            <td>{ROLE[m.role]}</td>
-            <td>{m.address.toLowerCase() !== me.toLowerCase() && <button className="btn danger" disabled={pending} onClick={() => revoke(m.address)}>Cabut</button>}</td>
-          </tr>))}</tbody></table>)}
-    </div>
-  </>);
+  return <><div className="page-heading"><div><span className="eyebrow">KONTROL AKSES</span><h1>Kelola role</h1><p className="sub">Tetapkan tanggung jawab dan akses tim melalui smart contract.</p></div><Badge tone="blue">Khusus Admin</Badge></div><div className="governance-note"><Icon name="roles" size={19} /><p>Semua Admin memiliki kewenangan setara, termasuk mencabut Admin lain. Admin tidak dapat mencabut atau menurunkan role sendiri.</p></div><section className="panel role-form-panel"><div className="panel-heading"><div><h2>Tetapkan role</h2><p>Gunakan alamat publik wallet. Private key tidak diperlukan.</p></div></div><form className="role-form" onSubmit={assign}><fieldset disabled={pending}><label>Alamat wallet<input required spellCheck="false" placeholder="0x…" value={addr} onChange={(e) => setAddr(e.target.value)} /></label><label>Role<select aria-label="Role" value={role} onChange={(e) => setRole(e.target.value)}>{ROLE.slice(1).map((r, i) => <option key={r} value={i + 1}>{r}</option>)}</select></label><button className="btn">Simpan role</button></fieldset></form></section><section className="panel"><div className="panel-heading"><div><h2>Wallet berizin</h2><p>Role berlaku setelah transaksi dikonfirmasi.</p></div><button className="btn ghost" disabled={pending} onClick={load}><Icon name="refresh" size={16} />Muat ulang role</button></div><div className="sheet">{loadFailed ? <EmptyState title="Daftar role gagal dimuat">Periksa RPC. Daftar anggota legacy belum mendukung pagination.</EmptyState> : list === null ? <Skeleton /> : <table><thead><tr><th>Wallet</th><th>Role</th><th>Aksi</th></tr></thead><tbody>{list.map((member) => <tr key={member.address}><td className="addr">{member.address}{member.address.toLowerCase() === me.toLowerCase() && <span className="you-label">Anda</span>}</td><td><Badge tone={member.role === 4 ? "blue" : "neutral"}>{ROLE[member.role]}</Badge></td><td>{member.address.toLowerCase() !== me.toLowerCase() && <button className="btn danger subtle" disabled={pending} onClick={() => setRevoking(member.address)}>Cabut</button>}</td></tr>)}</tbody></table>}</div></section>
+    {revoking && <Dialog title="Cabut akses wallet?" busy={pending} onClose={() => setRevoking(null)}><p className="addr">{revoking}</p><p>Wallet ini menjadi None dan kehilangan akses aplikasi setelah transaksi dikonfirmasi.</p><div className="dialog-actions"><button className="btn ghost" disabled={pending} onClick={() => setRevoking(null)}>Batal</button><button className="btn danger" disabled={pending} onClick={revoke}>Konfirmasi cabut role</button></div></Dialog>}
+  </>;
 }

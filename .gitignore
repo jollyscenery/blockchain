@@ -1,5 +1,15 @@
 node_modules
 .env
+.env.docker
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+backups/
+docker-audit-results/
+.audit-tools/
+slither-results*.json
+coverage/
 backend/.env
 backend/data.db*
 backend/contract.json
@@ -8,3 +18,6 @@ remix-abi.json
 frontend/dist
 artifacts
 cache
+
+# Generated security audit artifacts
+security-audit/
